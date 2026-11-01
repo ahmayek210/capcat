@@ -8,8 +8,98 @@ function show(id){$(id).classList.add('show');document.body.classList.add('modal
 function close(id){$(id).classList.remove('show');document.body.classList.remove('modal-open')}
 function banner(msg){$('banner').textContent=msg;$('banner').classList.toggle('hide',!msg)}
 function errorText(e){console.error(e);return 'Bir sorun oluştu. Lütfen tekrar dene.'}
-async function resize(file,max=1800){if(!file || !file.type.startsWith('image/')) throw Error('Geçerli bir fotoğraf seç.');let url=URL.createObjectURL(file);try{let img=new Image();img.src=url;await img.decode();let scale=Math.min(1,max/Math.max(img.naturalWidth,img.naturalHeight));let canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(img.naturalWidth*scale));canvas.height=Math.max(1,Math.round(img.naturalHeight*scale));let ctx=canvas.getContext('2d');ctx.fillStyle='#fff';ctx.fillRect(0,0,canvas.width,canvas.height);ctx.drawImage(img,0,0,canvas.width,canvas.height);let blob=await new Promise(r=>canvas.toBlob(r,'image/jpeg',.88));if(!blob) throw Error();return blob}catch(e){throw Error('Fotoğraf açılamadı. JPEG veya PNG deneyebilirsin.')}finally{URL.revokeObjectURL(url)}}
-function previewBlob(blob,img){let u=URL.createObjectURL(blob);$(img).src=u;$(img).onload=()=>URL.revokeObjectURL(u)}
+
+/*
+ * Normalise common camera/photo formats to JPEG before uploading.
+ * HEIC/HEIF and TIFF decoders are loaded lazily only when native decoding fails.
+ * The existing Supabase bucket accepts JPEG; no database changes are needed.
+ */
+const decoderLoads=new Map();
+function loadDecoder(url){
+  if(!decoderLoads.has(url)){
+    const promise=new Promise((resolve,reject)=>{
+      const script=document.createElement('script');
+      script.src=url;script.async=true;
+      script.onload=resolve;
+      script.onerror=()=>{script.remove();reject(new Error('Fotoğraf dönüştürücüsü yüklenemedi. İnternet bağlantını kontrol et.'))};
+      document.head.append(script);
+    }).catch(err=>{decoderLoads.delete(url);throw err});
+    decoderLoads.set(url,promise);
+  }
+  return decoderLoads.get(url);
+}
+function photoExtension(file){return (file.name||'').toLowerCase().match(/\.([a-z0-9]+)$/)?.[1]||''}
+function photoFormat(file){
+  const type=(file.type||'').toLowerCase(),ext=photoExtension(file);
+  const common=new Set(['jpg','jpeg','png','webp','gif','bmp','avif','heic','heif','tif','tiff','jxl']);
+  if(!type.startsWith('image/')&&!common.has(ext))throw new Error('Lütfen bir fotoğraf seç.');
+  if(type==='image/svg+xml'||ext==='svg')throw new Error('SVG yerine bir fotoğraf seç.');
+  return {type,ext,heic:['heic','heif'].includes(ext)||['image/heic','image/heif','image/heic-sequence','image/heif-sequence'].includes(type),tiff:['tif','tiff'].includes(ext)||['image/tiff','image/x-tiff'].includes(type)};
+}
+async function browserImage(blob){
+  const url=URL.createObjectURL(blob),img=new Image();
+  try{
+    await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=()=>reject(new Error('Görsel tarayıcıda açılamadı.'));img.src=url});
+    if(!img.naturalWidth||!img.naturalHeight)throw new Error('Fotoğraf bozuk veya boş.');
+    return {source:img,width:img.naturalWidth,height:img.naturalHeight,release:()=>URL.revokeObjectURL(url)};
+  }catch(err){URL.revokeObjectURL(url);throw err}
+}
+async function heicImage(file){
+  await loadDecoder('https://cdn.jsdelivr.net/npm/heic-to@1.6.7/dist/iife/heic-to.js');
+  if(typeof HeicTo!=='function')throw new Error('HEIC dönüştürücü yüklenemedi.');
+  const blob=await HeicTo({blob:file,type:'image/jpeg',quality:0.94});
+  return browserImage(blob);
+}
+async function tiffImage(file){
+  await loadDecoder('https://cdn.jsdelivr.net/npm/utif@3.1.0/UTIF.js');
+  if(typeof UTIF==='undefined')throw new Error('TIFF dönüştürücü yüklenemedi.');
+  const buffer=await file.arrayBuffer(),pages=UTIF.decode(buffer);
+  const page=pages.find(p=>Number(p.t256?.[0])>0&&Number(p.t257?.[0])>0);
+  if(!page)throw new Error('TIFF fotoğrafı okunamadı.');
+  const width=Number(page.t256[0]),height=Number(page.t257[0]);
+  if(width*height>25000000)throw new Error('TIFF fotoğrafı çok büyük. Daha küçük bir sürümünü seç.');
+  UTIF.decodeImage(buffer,page);
+  const pixels=UTIF.toRGBA8(page);
+  const canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;
+  const ctx=canvas.getContext('2d');
+  if(!ctx)throw new Error('Fotoğraf işlenemedi.');
+  ctx.putImageData(new ImageData(new Uint8ClampedArray(pixels),width,height),0,0);
+  return {source:canvas,width,height,release:()=>{canvas.width=0;canvas.height=0}};
+}
+async function resize(file,max=1800){
+  if(!file||!file.size)throw new Error('Lütfen bir fotoğraf seç.');
+  if(file.size>60*1024*1024)throw new Error('Fotoğraf çok büyük. Daha küçük bir dosya seç.');
+  const format=photoFormat(file);
+  let decoded;
+  try{
+    // Safari and newer browsers can decode some HEIC/AVIF images natively.
+    try{decoded=await browserImage(file)}
+    catch(nativeError){
+      if(format.heic)decoded=await heicImage(file);
+      else if(format.tiff)decoded=await tiffImage(file);
+      else throw nativeError;
+    }
+    const {source,width,height}=decoded;
+    if(width*height>100000000)throw new Error('Fotoğraf çözünürlüğü çok büyük.');
+    const scale=Math.min(1,max/Math.max(width,height));
+    const canvas=document.createElement('canvas');
+    canvas.width=Math.max(1,Math.round(width*scale));
+    canvas.height=Math.max(1,Math.round(height*scale));
+    const ctx=canvas.getContext('2d');
+    if(!ctx)throw new Error('Fotoğraf işlenemedi.');
+    ctx.fillStyle='#fff';ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
+    ctx.drawImage(source,0,0,canvas.width,canvas.height);
+    const jpeg=await new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(new Error('JPEG oluşturulamadı.')),'image/jpeg',.88));
+    canvas.width=0;canvas.height=0;
+    return jpeg;
+  }catch(err){
+    if(err.message?.startsWith('Fotoğraf ')||err.message?.startsWith('TIFF ')||err.message?.startsWith('HEIC ')||err.message?.startsWith('Görsel ')||err.message?.startsWith('JPEG ')||err.message?.startsWith('Lütfen ')||err.message?.startsWith('SVG '))throw err;
+    console.error('Görsel dönüştürülemedi:',err);
+    throw new Error('Bu fotoğraf açılamadı. Farklı bir dosya deneyebilirsin.');
+  }finally{decoded?.release()}
+}
+function previewBlob(blob,img){const element=$(img),previous=element.dataset.objectUrl;if(previous)URL.revokeObjectURL(previous);const url=URL.createObjectURL(blob);element.dataset.objectUrl=url;element.onload=element.onerror=()=>{URL.revokeObjectURL(url);if(element.dataset.objectUrl===url)delete element.dataset.objectUrl};element.src=url}
 async function upload(blob){let path=`${user.id}/${crypto.randomUUID()}.jpg`;let {error}=await db.storage.from('capcat-images').upload(path,blob,{contentType:'image/jpeg'});if(error)throw error;return path}
 const urlCache=new Map();
 async function signed(path){
